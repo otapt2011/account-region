@@ -25,47 +25,79 @@ const VALID_COUNTRY_CODES = new Set([
   'VN','VU','WF','WS','YE','YT','ZA','ZM','ZW'
 ]);
 
+// IDC → country mapping (most common data centres)
+const IDC_MAP = {
+  'useast': 'US',
+  'uswest': 'US',
+  'europe': 'GB',
+  'asia': 'SG',
+  'ap': 'SG',
+  'au': 'AU',
+  'jp': 'JP',
+  'kr': 'KR',
+  'sa': 'SA',
+};
+
 function isValidCountryCode(val) {
   return typeof val === 'string' && val.length === 2 && VALID_COUNTRY_CODES.has(val.toUpperCase());
 }
 
-// Search INSIDE an object, but skip any path containing excluded segments.
-// We also skip keys that are not user-related if we are outside the user-detail scope.
-function findRegionSafe(obj, depth = 0, path = '') {
-  if (!obj || typeof obj !== 'object' || depth > 6) return null;
+// Extract country from avatar URL's "idc" parameter
+function extractCountryFromAvatar(url) {
+  if (!url) return null;
+  const match = url.match(/idc=([^&]+)/);
+  if (!match) return null;
+  const idc = match[1].toLowerCase();
+  // Direct match
+  if (IDC_MAP[idc]) return IDC_MAP[idc];
+  // Prefix match (e.g., useast8 → useast)
+  for (const prefix of Object.keys(IDC_MAP)) {
+    if (idc.startsWith(prefix)) return IDC_MAP[prefix];
+  }
+  return null;
+}
 
-  // Skip entire branches that are definitely noise
-  const lowerPath = path.toLowerCase();
-  if (lowerPath.includes('app-context') || lowerPath.includes('appcontext') ||
-      lowerPath.includes('i18n') || lowerPath.includes('translations') ||
-      lowerPath.includes('messages') || lowerPath.includes('__typename')) {
+// Find region inside userDetail only (no app-context)
+function findRegionInUserDetail(userDetail) {
+  if (!userDetail) return null;
+
+  // Direct fields inside user object
+  const user = userDetail?.userInfo?.user || userDetail?.user || userDetail?.userInfo || userDetail;
+  if (user?.id || user?.uniqueId || user?.secUid) {
+    const direct = user.region || user.accountRegion || user.country || user.countryCode;
+    if (isValidCountryCode(direct)) return direct.trim().toUpperCase();
+  }
+
+  // Safe recursive scan (exclude app-context, i18n, etc.)
+  function scan(obj, depth = 0, path = '') {
+    if (!obj || typeof obj !== 'object' || depth > 6) return null;
+    const lowerPath = path.toLowerCase();
+    if (lowerPath.includes('app-context') || lowerPath.includes('appcontext') ||
+        lowerPath.includes('i18n') || lowerPath.includes('translations') ||
+        lowerPath.includes('messages') || lowerPath.includes('__typename')) return null;
+
+    for (const key in obj) {
+      if (['i18n','translations','messages','appContext','app-context','__typename'].includes(key)) continue;
+      const lowerKey = key.toLowerCase();
+      if (lowerKey.includes('region') || lowerKey.includes('country')) {
+        const val = obj[key];
+        if (typeof val === 'string') {
+          const code = val.trim().toUpperCase();
+          if (isValidCountryCode(code)) return code;
+          const m = code.match(/[_-]([A-Z]{2})$/);
+          if (m && isValidCountryCode(m[1])) return m[1];
+        }
+      }
+      const child = obj[key];
+      if (child && typeof child === 'object') {
+        const found = scan(child, depth + 1, path ? `${path}.${key}` : key);
+        if (found) return found;
+      }
+    }
     return null;
   }
 
-  // Check keys whose name contains "region" or "country"
-  for (const key in obj) {
-    const lowerKey = key.toLowerCase();
-    if (lowerKey.includes('region') || lowerKey.includes('country')) {
-      const val = obj[key];
-      if (typeof val === 'string') {
-        const code = val.trim().toUpperCase();
-        if (isValidCountryCode(code)) return code;
-        const m = code.match(/[_-]([A-Z]{2})$/);
-        if (m && isValidCountryCode(m[1])) return m[1];
-      }
-    }
-  }
-
-  // Recurse into sub‑objects (but skip noise keys)
-  for (const key in obj) {
-    if (['i18n','translations','messages','appContext','app-context','__typename'].includes(key)) continue;
-    const child = obj[key];
-    if (child && typeof child === 'object') {
-      const found = findRegionSafe(child, depth + 1, path ? `${path}.${key}` : key);
-      if (found) return found;
-    }
-  }
-  return null;
+  return scan(userDetail, 0, 'userDetail');
 }
 
 export default async function handler(req, res) {
@@ -93,54 +125,43 @@ export default async function handler(req, res) {
     });
     const html = await resp.text();
 
-    // Extract main script
     const mainMatch = html.match(/<script id="__UNIVERSAL_DATA_FOR_REHYDRATION__" type="application\/json">(.*?)<\/script>/s);
     if (!mainMatch) return res.status(500).json({ error: 'Page structure changed' });
 
     const universal = JSON.parse(mainMatch[1]);
     const userDetail = universal?.['__DEFAULT_SCOPE__']?.['webapp.user-detail'];
 
-    // Debug: return the raw userDetail (the only relevant part)
     if (debug === '1' || debug === 'all') {
       return res.status(200).json({ success: true, debug: true, userDetail });
     }
 
     if (!userDetail) return res.status(404).json({ error: 'User not found' });
 
-    // 1. Direct extraction from the most common user‑object paths
-    const userObjectsToTry = [
-      userDetail?.userInfo?.user,
-      userDetail?.user,
-      userDetail?.userInfo,
-      userDetail
-    ];
+    // 1. Try to find region inside userDetail (ignoring app-context)
+    let region = findRegionInUserDetail(userDetail);
+    let source = 'user-detail';
 
-    let region = null;
-    for (const obj of userObjectsToTry) {
-      if (!obj) continue;
-      // Only consider objects that look like a user (have id, uniqueId, or secUid)
-      if (obj.id || obj.uniqueId || obj.secUid) {
-        const direct = obj.region || obj.accountRegion || obj.country || obj.countryCode;
-        if (typeof direct === 'string' && isValidCountryCode(direct)) {
-          region = direct.trim().toUpperCase();
-          break;
-        }
-        // Also try a safe recursive scan inside this user object
-        region = findRegionSafe(obj, 0, 'user');
-        if (region) break;
+    // 2. Fallback: app-context.region (now it's acceptable because we've confirmed userDetail lacks one)
+    if (!region) {
+      const appContext = universal?.['__DEFAULT_SCOPE__']?.['webapp.app-context'];
+      if (appContext?.region && isValidCountryCode(appContext.region)) {
+        region = appContext.region.toUpperCase();
+        source = 'app-context';
       }
     }
 
-    // 2. If still not found, perform a safe recursive scan over the whole userDetail
+    // 3. Last resort: avatar URL idc parameter
     if (!region) {
-      region = findRegionSafe(userDetail, 0, 'userDetail');
+      const avatarUrl = userDetail?.userInfo?.user?.avatarLarger || userDetail?.user?.avatarLarger || '';
+      region = extractCountryFromAvatar(avatarUrl);
+      source = region ? 'avatar-idc' : null;
     }
 
     res.status(200).json({
       success: true,
       username,
       region: region || null,
-      regionSource: region ? 'user-detail' : null
+      regionSource: source,
     });
   } catch (err) {
     res.status(500).json({ error: err.message });
