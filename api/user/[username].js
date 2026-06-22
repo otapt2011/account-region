@@ -6,6 +6,7 @@ function setCorsHeaders(res) {
   res.setHeader('Access-Control-Allow-Headers', 'X-API-Key, Content-Type');
 }
 
+// ISO 3166-1 alpha-2 whitelist
 const VALID_COUNTRY_CODES = new Set([
   'AD','AE','AF','AG','AI','AL','AM','AO','AQ','AR','AS','AT','AU','AW','AX','AZ',
   'BA','BB','BD','BE','BF','BG','BH','BI','BJ','BL','BM','BN','BO','BQ','BR','BS',
@@ -25,28 +26,37 @@ const VALID_COUNTRY_CODES = new Set([
   'VN','VU','WF','WS','YE','YT','ZA','ZM','ZW'
 ]);
 
-// Recursively find a valid country code, skipping known noise branches
-function findRegionInObject(obj, depth = 0) {
-  if (!obj || typeof obj !== 'object' || depth > 5) return null;
+// Detect if a string is a valid country code (exactly 2 letters, known code)
+function isValidCountryCode(val) {
+  return typeof val === 'string' && val.length === 2 && VALID_COUNTRY_CODES.has(val.toUpperCase());
+}
 
-  // Direct keys to try first
-  for (const key of ['region', 'accountRegion', 'country', 'countryCode']) {
-    const val = obj[key];
-    if (typeof val === 'string' && val.length === 2 && VALID_COUNTRY_CODES.has(val.toUpperCase()))
-      return val.toUpperCase();
-    // Locale fallback: "en-US"
-    if (typeof val === 'string') {
-      const m = val.match(/[_-]([A-Z]{2})$/);
-      if (m && VALID_COUNTRY_CODES.has(m[1])) return m[1];
+// Recursively search an object for any property whose name contains "region" or "country"
+// (case-insensitive), and whose value is a valid country code.
+function findRegionByKeyName(obj, depth = 0) {
+  if (!obj || typeof obj !== 'object' || depth > 6) return null;
+
+  for (const key in obj) {
+    const lowerKey = key.toLowerCase();
+    // Look for property names that contain 'region' or 'country'
+    if (lowerKey.includes('region') || lowerKey.includes('country')) {
+      const val = obj[key];
+      if (typeof val === 'string') {
+        const code = val.trim().toUpperCase();
+        if (isValidCountryCode(code)) return code;
+        // Locale fallback: e.g., "en-US"
+        const m = code.match(/[_-]([A-Z]{2})$/);
+        if (m && isValidCountryCode(m[1])) return m[1];
+      }
     }
   }
 
-  // Recurse into sub-objects, but skip translation/app-context/i18n
+  // Recurse into sub-objects, but skip translation / i18n noise
   for (const key in obj) {
     if (['i18n', 'translations', 'messages', 'appContext', 'app-context', '__typename'].includes(key)) continue;
-    const val = obj[key];
-    if (typeof val === 'object' && val !== null) {
-      const found = findRegionInObject(val, depth + 1);
+    const child = obj[key];
+    if (child && typeof child === 'object') {
+      const found = findRegionByKeyName(child, depth + 1);
       if (found) return found;
     }
   }
@@ -79,7 +89,7 @@ export default async function handler(req, res) {
     const html = await resp.text();
 
     const match = html.match(/<script id="__UNIVERSAL_DATA_FOR_REHYDRATION__" type="application\/json">(.*?)<\/script>/s);
-    if (!match) return res.status(500).json({ error: 'Page structure changed' });
+    if (!match) return res.status(500).json({ error: 'Page structure changed – script not found' });
 
     const universal = JSON.parse(match[1]);
     const userDetail = universal?.['__DEFAULT_SCOPE__']?.['webapp.user-detail'];
@@ -88,43 +98,16 @@ export default async function handler(req, res) {
       return res.status(200).json({ debug: true, userDetail });
     }
 
-    if (!userDetail) return res.status(404).json({ error: 'User not found' });
+    if (!userDetail) return res.status(404).json({ error: 'User not found in page data' });
 
-    // Focus only on user-like objects: try known paths, then the whole userDetail
-    const possibleUserObjects = [
-      userDetail?.userInfo?.user,
-      userDetail?.user,
-      userDetail?.userInfo,
-      userDetail
-    ];
-
-    let region = null;
-    for (const obj of possibleUserObjects) {
-      if (!obj) continue;
-      // Must look like a user (has id or uniqueId)
-      if (obj.id || obj.uniqueId || obj.secUid) {
-        // Direct region check
-        region = obj.region || obj.accountRegion || obj.country || obj.countryCode;
-        if (region && typeof region === 'string' && region.length === 2 && VALID_COUNTRY_CODES.has(region.toUpperCase())) {
-          region = region.toUpperCase();
-          break;
-        }
-        // If direct check fails, try deeper search inside this user object
-        region = findRegionInObject(obj);
-        if (region) break;
-      }
-    }
-
-    // If still nothing, try the entire userDetail with the same safe search
-    if (!region) {
-      region = findRegionInObject(userDetail);
-    }
+    // Search inside userDetail only
+    const region = findRegionByKeyName(userDetail);
 
     res.status(200).json({
       success: true,
       username,
       region: region || null,
-      regionSource: region ? 'extracted' : null
+      regionSource: region ? 'property-name-match' : null
     });
   } catch (err) {
     res.status(500).json({ error: err.message });
