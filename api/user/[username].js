@@ -6,62 +6,50 @@ function setCorsHeaders(res) {
   res.setHeader('Access-Control-Allow-Headers', 'X-API-Key, Content-Type');
 }
 
-// ------------------ region extraction ------------------
-function findRegionDeep(obj, depth = 0, path = '') {
-  if (!obj || typeof obj !== 'object' || depth > 20) return null;
-  const possibleKeys = ['region', 'accountRegion', 'regionCode', 'country', 'countryCode', 'locale', 'geo', 'location'];
+// ---------- user‑specific region extraction ----------
+const EXCLUDED_PATH_SEGMENTS = ['app-context', 'appContext', 'context', 'serverContext', 'clientContext'];
 
-  for (const actualKey in obj) {
-    for (const key of possibleKeys) {
-      if (actualKey.toLowerCase() === key.toLowerCase() && typeof obj[actualKey] === 'string') {
-        const val = obj[actualKey];
-        if (val.length === 2 && /^[A-Z]{2}$/.test(val)) return { value: val, source: `${path}.${actualKey}` };
+function findUserRegion(obj, depth = 0, path = '') {
+  if (!obj || typeof obj !== 'object' || depth > 20) return null;
+  if (EXCLUDED_PATH_SEGMENTS.some(seg => path.toLowerCase().includes(seg.toLowerCase()))) return null;
+
+  // Priority keys that are typically inside user objects
+  const priorityKeys = ['region', 'accountRegion', 'country', 'countryCode', 'locale'];
+  for (const key of priorityKeys) {
+    if (obj[key] && typeof obj[key] === 'string') {
+      const val = obj[key];
+      // Two‑letter country code
+      if (val.length === 2 && /^[A-Z]{2}$/.test(val)) {
+        return { value: val, source: `${path}.${key}` };
+      }
+      // Longer locale string (e.g., "en-US") – take last two chars
+      const localeMatch = val.match(/[_-]([A-Z]{2})$/);
+      if (localeMatch) {
+        return { value: localeMatch[1], source: `${path}.${key}` };
       }
     }
   }
-  // any two-letter uppercase string
+
+  // Generic check for any two‑letter uppercase string
   for (const key in obj) {
-    if (typeof obj[key] === 'string' && obj[key].length === 2 && /^[A-Z]{2}$/.test(obj[key]))
+    if (typeof obj[key] === 'string' && obj[key].length === 2 && /^[A-Z]{2}$/.test(obj[key])) {
       return { value: obj[key], source: `${path}.${key}` };
+    }
   }
-  // recurse
+
+  // Recurse into sub‑objects (but skip excluded paths)
   for (const key in obj) {
     if (obj[key] && typeof obj[key] === 'object') {
-      const found = findRegionDeep(obj[key], depth + 1, path ? `${path}.${key}` : key);
+      const newPath = path ? `${path}.${key}` : key;
+      // Skip if path contains an excluded segment
+      if (EXCLUDED_PATH_SEGMENTS.some(seg => newPath.toLowerCase().includes(seg.toLowerCase()))) continue;
+      const found = findUserRegion(obj[key], depth + 1, newPath);
       if (found) return found;
     }
   }
   return null;
 }
-
-function extractAllJsonFromHtml(html) {
-  const jsonData = [];
-  // __UNIVERSAL_DATA_FOR_REHYDRATION__
-  const mainMatch = html.match(/<script id="__UNIVERSAL_DATA_FOR_REHYDRATION__" type="application\/json">(.*?)<\/script>/s);
-  if (mainMatch) {
-    try { jsonData.push(JSON.parse(mainMatch[1])); } catch (e) {}
-  }
-  // Other application/json scripts
-  const allScripts = html.match(/<script[^>]*type="application\/json"[^>]*>(.*?)<\/script>/gis);
-  if (allScripts) {
-    for (const script of allScripts) {
-      const match = script.match(/>([\s\S]*?)<\/script>/);
-      if (match) try { jsonData.push(JSON.parse(match[1])); } catch (e) {}
-    }
-  }
-  // __NEXT_DATA__ / __INITIAL_STATE__
-  const inlineScripts = html.match(/<script[^>]*>([\s\S]*?)<\/script>/gi);
-  if (inlineScripts) {
-    for (const script of inlineScripts) {
-      const nextDataMatch = script.match(/__NEXT_DATA__\s*=\s*({[\s\S]*?});/);
-      if (nextDataMatch) try { jsonData.push(JSON.parse(nextDataMatch[1])); } catch (e) {}
-      const initStateMatch = script.match(/window\.__INITIAL_STATE__\s*=\s*({[\s\S]*?});/);
-      if (initStateMatch) try { jsonData.push(JSON.parse(initStateMatch[1])); } catch (e) {}
-    }
-  }
-  return jsonData;
-}
-// -----------------------------------------------------
+// ----------------------------------------------------
 
 export default async function handler(req, res) {
   if (req.method === 'OPTIONS') {
@@ -70,7 +58,6 @@ export default async function handler(req, res) {
   }
   setCorsHeaders(res);
 
-  // simple auth check
   const authHeader = req.headers['x-api-key'] || req.headers['authorization'];
   if (authHeader !== process.env.API_SECRET_KEY) {
     return res.status(401).json({ error: 'Unauthorized' });
@@ -89,9 +76,11 @@ export default async function handler(req, res) {
     });
     const html = await response.text();
 
-    // main user data
+    // 1. Extract the main user‑detail blob
     let userDetail = null;
-    const mainMatch = html.match(/<script id="__UNIVERSAL_DATA_FOR_REHYDRATION__" type="application\/json">(.*?)<\/script>/s);
+    const mainMatch = html.match(
+      /<script id="__UNIVERSAL_DATA_FOR_REHYDRATION__" type="application\/json">(.*?)<\/script>/s
+    );
     if (mainMatch) {
       try {
         const data = JSON.parse(mainMatch[1]);
@@ -100,28 +89,66 @@ export default async function handler(req, res) {
     }
 
     let regionInfo = null;
-    if (userDetail) {
-      regionInfo = findRegionDeep(userDetail);
-      if (regionInfo?.value) regionInfo.source = `userDetail.${regionInfo.source}`;
-    }
 
-    // search all other JSON blobs
-    if (!regionInfo?.value) {
-      const allJsonData = extractAllJsonFromHtml(html);
-      for (const jsonObj of allJsonData) {
-        const found = findRegionDeep(jsonObj);
-        if (found?.value) {
-          regionInfo = found;
-          regionInfo.source = `other_script.${regionInfo.source}`;
-          break;
+    // 2. Direct check inside the user object (most reliable)
+    if (userDetail?.user) {
+      const user = userDetail.user;
+      const directKeys = ['region', 'accountRegion', 'country', 'countryCode'];
+      for (const key of directKeys) {
+        if (user[key] && typeof user[key] === 'string') {
+          const val = user[key];
+          if (val.length === 2 && /^[A-Z]{2}$/.test(val)) {
+            regionInfo = { value: val, source: `userDetail.user.${key}` };
+            break;
+          }
         }
       }
     }
 
-    // fallback regex
+    // 3. If still not found, run filtered deep search on the whole __UNIVERSAL_DATA
+    if (!regionInfo?.value && mainMatch) {
+      const data = JSON.parse(mainMatch[1]);
+      const found = findUserRegion(data);
+      if (found) {
+        regionInfo = found;
+        regionInfo.source = `universal.${regionInfo.source}`;
+      }
+    }
+
+    // 4. If still missing, scan other JSON blobs (with the same exclusion logic)
     if (!regionInfo?.value) {
-      const match = html.match(/"region":"([A-Z]{2})"/i) || html.match(/"accountRegion":"([A-Z]{2})"/i);
-      if (match) regionInfo = { value: match[1], source: 'html_regex' };
+      const otherJsonMatches = html.match(
+        /<script[^>]*type="application\/json"[^>]*>(.*?)<\/script>/gis
+      ) || [];
+      for (const script of otherJsonMatches) {
+        const match = script.match(/>([\s\S]*?)<\/script>/);
+        if (!match) continue;
+        try {
+          const obj = JSON.parse(match[1]);
+          const found = findUserRegion(obj);
+          if (found) {
+            regionInfo = found;
+            regionInfo.source = `other_script.${regionInfo.source}`;
+            break;
+          }
+        } catch (e) {}
+      }
+    }
+
+    // 5. Final fallback: regex on HTML (but only for a real user region, not context)
+    if (!regionInfo?.value) {
+      const regionRegex = /"region":"([A-Z]{2})"/gi;
+      let m;
+      while ((m = regionRegex.exec(html)) !== null) {
+        const val = m[1];
+        // Ignore if it's inside an app-context block
+        const before = html.substring(0, m.index);
+        const lastContextIdx = before.lastIndexOf('app-context');
+        if (lastContextIdx === -1 || before.substring(lastContextIdx).includes('user-detail')) {
+          regionInfo = { value: val, source: 'html_regex' };
+          break;
+        }
+      }
     }
 
     res.status(200).json({
