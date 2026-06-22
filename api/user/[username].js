@@ -6,42 +6,66 @@ function setCorsHeaders(res) {
   res.setHeader('Access-Control-Allow-Headers', 'X-API-Key, Content-Type');
 }
 
-// ---------- user‑specific region extraction ----------
-const EXCLUDED_PATH_SEGMENTS = ['app-context', 'appContext', 'context', 'serverContext', 'clientContext'];
+// ---------- ISO 3166‑1 alpha‑2 country code whitelist ----------
+const VALID_COUNTRY_CODES = new Set([
+  'AD','AE','AF','AG','AI','AL','AM','AO','AQ','AR','AS','AT','AU','AW','AX','AZ',
+  'BA','BB','BD','BE','BF','BG','BH','BI','BJ','BL','BM','BN','BO','BQ','BR','BS',
+  'BT','BV','BW','BY','BZ','CA','CC','CD','CF','CG','CH','CI','CK','CL','CM','CN',
+  'CO','CR','CU','CV','CW','CX','CY','CZ','DE','DJ','DK','DM','DO','DZ','EC','EE',
+  'EG','EH','ER','ES','ET','FI','FJ','FK','FM','FO','FR','GA','GB','GD','GE','GF',
+  'GG','GH','GI','GL','GM','GN','GP','GQ','GR','GS','GT','GU','GW','GY','HK','HM',
+  'HN','HR','HT','HU','ID','IE','IL','IM','IN','IO','IQ','IR','IS','IT','JE','JM',
+  'JO','JP','KE','KG','KH','KI','KM','KN','KP','KR','KW','KY','KZ','LA','LB','LC',
+  'LI','LK','LR','LS','LT','LU','LV','LY','MA','MC','MD','ME','MF','MG','MH','MK',
+  'ML','MM','MN','MO','MP','MQ','MR','MS','MT','MU','MV','MW','MX','MY','MZ','NA',
+  'NC','NE','NF','NG','NI','NL','NO','NP','NR','NU','NZ','OM','PA','PE','PF','PG',
+  'PH','PK','PL','PM','PN','PR','PS','PT','PW','PY','QA','RE','RO','RS','RU','RW',
+  'SA','SB','SC','SD','SE','SG','SH','SI','SJ','SK','SL','SM','SN','SO','SR','SS',
+  'ST','SV','SX','SY','SZ','TC','TD','TF','TG','TH','TJ','TK','TL','TM','TN','TO',
+  'TR','TT','TV','TW','TZ','UA','UG','UM','US','UY','UZ','VA','VC','VE','VG','VI',
+  'VN','VU','WF','WS','YE','YT','ZA','ZM','ZW'
+]);
+// ----------------------------------------------------------------
+
+// Paths to exclude (app context, translations, etc.)
+const EXCLUDED_PATH_SEGMENTS = [
+  'app-context', 'appContext', 'context', 'serverContext', 'clientContext',
+  'i18n', 'translation', 'translations', 'localeData', 'messages'
+];
 
 function findUserRegion(obj, depth = 0, path = '') {
   if (!obj || typeof obj !== 'object' || depth > 20) return null;
+  // Skip entire branches that should never contain user location
   if (EXCLUDED_PATH_SEGMENTS.some(seg => path.toLowerCase().includes(seg.toLowerCase()))) return null;
 
-  // Priority keys that are typically inside user objects
+  // Priority keys inside user objects
   const priorityKeys = ['region', 'accountRegion', 'country', 'countryCode', 'locale'];
   for (const key of priorityKeys) {
     if (obj[key] && typeof obj[key] === 'string') {
       const val = obj[key];
-      // Two‑letter country code
-      if (val.length === 2 && /^[A-Z]{2}$/.test(val)) {
+      // Direct two‑letter country code
+      if (val.length === 2 && /^[A-Z]{2}$/.test(val) && VALID_COUNTRY_CODES.has(val)) {
         return { value: val, source: `${path}.${key}` };
       }
-      // Longer locale string (e.g., "en-US") – take last two chars
+      // Locale string like "en-US"
       const localeMatch = val.match(/[_-]([A-Z]{2})$/);
-      if (localeMatch) {
+      if (localeMatch && VALID_COUNTRY_CODES.has(localeMatch[1])) {
         return { value: localeMatch[1], source: `${path}.${key}` };
       }
     }
   }
 
-  // Generic check for any two‑letter uppercase string
+  // Any two‑letter uppercase string that is a valid country code
   for (const key in obj) {
-    if (typeof obj[key] === 'string' && obj[key].length === 2 && /^[A-Z]{2}$/.test(obj[key])) {
+    if (typeof obj[key] === 'string' && obj[key].length === 2 && /^[A-Z]{2}$/.test(obj[key]) && VALID_COUNTRY_CODES.has(obj[key])) {
       return { value: obj[key], source: `${path}.${key}` };
     }
   }
 
-  // Recurse into sub‑objects (but skip excluded paths)
+  // Recurse into sub‑objects (skip excluded paths)
   for (const key in obj) {
     if (obj[key] && typeof obj[key] === 'object') {
       const newPath = path ? `${path}.${key}` : key;
-      // Skip if path contains an excluded segment
       if (EXCLUDED_PATH_SEGMENTS.some(seg => newPath.toLowerCase().includes(seg.toLowerCase()))) continue;
       const found = findUserRegion(obj[key], depth + 1, newPath);
       if (found) return found;
@@ -49,7 +73,6 @@ function findUserRegion(obj, depth = 0, path = '') {
   }
   return null;
 }
-// ----------------------------------------------------
 
 export default async function handler(req, res) {
   if (req.method === 'OPTIONS') {
@@ -76,7 +99,7 @@ export default async function handler(req, res) {
     });
     const html = await response.text();
 
-    // 1. Extract the main user‑detail blob
+    // 1. Extract main user‑detail blob
     let userDetail = null;
     const mainMatch = html.match(
       /<script id="__UNIVERSAL_DATA_FOR_REHYDRATION__" type="application\/json">(.*?)<\/script>/s
@@ -90,14 +113,14 @@ export default async function handler(req, res) {
 
     let regionInfo = null;
 
-    // 2. Direct check inside the user object (most reliable)
+    // 2. Direct check inside user object
     if (userDetail?.user) {
       const user = userDetail.user;
       const directKeys = ['region', 'accountRegion', 'country', 'countryCode'];
       for (const key of directKeys) {
         if (user[key] && typeof user[key] === 'string') {
           const val = user[key];
-          if (val.length === 2 && /^[A-Z]{2}$/.test(val)) {
+          if (val.length === 2 && /^[A-Z]{2}$/.test(val) && VALID_COUNTRY_CODES.has(val)) {
             regionInfo = { value: val, source: `userDetail.user.${key}` };
             break;
           }
@@ -105,7 +128,7 @@ export default async function handler(req, res) {
       }
     }
 
-    // 3. If still not found, run filtered deep search on the whole __UNIVERSAL_DATA
+    // 3. Filtered deep search on the full UNIVERSAL_DATA
     if (!regionInfo?.value && mainMatch) {
       const data = JSON.parse(mainMatch[1]);
       const found = findUserRegion(data);
@@ -115,7 +138,7 @@ export default async function handler(req, res) {
       }
     }
 
-    // 4. If still missing, scan other JSON blobs (with the same exclusion logic)
+    // 4. Scan other JSON blobs (excluded paths already in the function)
     if (!regionInfo?.value) {
       const otherJsonMatches = html.match(
         /<script[^>]*type="application\/json"[^>]*>(.*?)<\/script>/gis
@@ -135,13 +158,14 @@ export default async function handler(req, res) {
       }
     }
 
-    // 5. Final fallback: regex on HTML (but only for a real user region, not context)
+    // 5. Final regex fallback (with validation)
     if (!regionInfo?.value) {
       const regionRegex = /"region":"([A-Z]{2})"/gi;
       let m;
       while ((m = regionRegex.exec(html)) !== null) {
         const val = m[1];
-        // Ignore if it's inside an app-context block
+        if (!VALID_COUNTRY_CODES.has(val)) continue;
+        // Check it's not inside an app‑context block
         const before = html.substring(0, m.index);
         const lastContextIdx = before.lastIndexOf('app-context');
         if (lastContextIdx === -1 || before.substring(lastContextIdx).includes('user-detail')) {
