@@ -6,7 +6,6 @@ function setCorsHeaders(res) {
   res.setHeader('Access-Control-Allow-Headers', 'X-API-Key, Content-Type');
 }
 
-// ISO 3166-1 alpha-2 whitelist
 const VALID_COUNTRY_CODES = new Set([
   'AD','AE','AF','AG','AI','AL','AM','AO','AQ','AR','AS','AT','AU','AW','AX','AZ',
   'BA','BB','BD','BE','BF','BG','BH','BI','BJ','BL','BM','BN','BO','BQ','BR','BS',
@@ -26,37 +25,74 @@ const VALID_COUNTRY_CODES = new Set([
   'VN','VU','WF','WS','YE','YT','ZA','ZM','ZW'
 ]);
 
-// Detect if a string is a valid country code (exactly 2 letters, known code)
 function isValidCountryCode(val) {
   return typeof val === 'string' && val.length === 2 && VALID_COUNTRY_CODES.has(val.toUpperCase());
 }
 
-// Recursively search an object for any property whose name contains "region" or "country"
-// (case-insensitive), and whose value is a valid country code.
-function findRegionByKeyName(obj, depth = 0) {
-  if (!obj || typeof obj !== 'object' || depth > 6) return null;
+// Extract every JSON blob from the HTML
+function extractAllJsonBlobs(html) {
+  const blobs = [];
 
-  for (const key in obj) {
-    const lowerKey = key.toLowerCase();
-    // Look for property names that contain 'region' or 'country'
-    if (lowerKey.includes('region') || lowerKey.includes('country')) {
-      const val = obj[key];
-      if (typeof val === 'string') {
-        const code = val.trim().toUpperCase();
-        if (isValidCountryCode(code)) return code;
-        // Locale fallback: e.g., "en-US"
-        const m = code.match(/[_-]([A-Z]{2})$/);
-        if (m && isValidCountryCode(m[1])) return m[1];
+  // __UNIVERSAL_DATA_FOR_REHYDRATION__
+  const mainMatch = html.match(/<script id="__UNIVERSAL_DATA_FOR_REHYDRATION__" type="application\/json">(.*?)<\/script>/s);
+  if (mainMatch) {
+    try { blobs.push({ source: 'UNIVERSAL_DATA', data: JSON.parse(mainMatch[1]) }); } catch(e) {}
+  }
+
+  // Other application/json scripts
+  const otherScripts = html.match(/<script[^>]*type="application\/json"[^>]*>(.*?)<\/script>/gis);
+  if (otherScripts) {
+    for (const script of otherScripts) {
+      const m = script.match(/>([\s\S]*?)<\/script>/);
+      if (m) {
+        try { blobs.push({ source: 'other_json', data: JSON.parse(m[1]) }); } catch(e) {}
       }
     }
   }
 
-  // Recurse into sub-objects, but skip translation / i18n noise
+  // Inline scripts with __NEXT_DATA__ or __INITIAL_STATE__
+  const inlineScripts = html.match(/<script[^>]*>([\s\S]*?)<\/script>/gi);
+  if (inlineScripts) {
+    for (const script of inlineScripts) {
+      const nextMatch = script.match(/__NEXT_DATA__\s*=\s*({[\s\S]*?});/);
+      if (nextMatch) {
+        try { blobs.push({ source: 'NEXT_DATA', data: JSON.parse(nextMatch[1]) }); } catch(e) {}
+      }
+      const initMatch = script.match(/window\.__INITIAL_STATE__\s*=\s*({[\s\S]*?});/);
+      if (initMatch) {
+        try { blobs.push({ source: 'INITIAL_STATE', data: JSON.parse(initMatch[1]) }); } catch(e) {}
+      }
+    }
+  }
+
+  return blobs;
+}
+
+// Search a single JSON object for any property name that contains "region" or "country"
+function findRegionInBlob(obj, depth = 0, path = '') {
+  if (!obj || typeof obj !== 'object' || depth > 8) return null;
+
+  // Check all properties whose name includes region/country (case-insensitive)
   for (const key in obj) {
-    if (['i18n', 'translations', 'messages', 'appContext', 'app-context', '__typename'].includes(key)) continue;
+    const lowerKey = key.toLowerCase();
+    if (lowerKey.includes('region') || lowerKey.includes('country')) {
+      const val = obj[key];
+      if (typeof val === 'string') {
+        const code = val.trim().toUpperCase();
+        if (isValidCountryCode(code)) return { value: code, source: `${path}.${key}` };
+        // Locale like "en-US"
+        const m = code.match(/[_-]([A-Z]{2})$/);
+        if (m && isValidCountryCode(m[1])) return { value: m[1], source: `${path}.${key}` };
+      }
+    }
+  }
+
+  // Recurse, but skip obvious noise
+  for (const key in obj) {
+    if (['i18n','translations','messages','appContext','app-context','__typename'].includes(key)) continue;
     const child = obj[key];
     if (child && typeof child === 'object') {
-      const found = findRegionByKeyName(child, depth + 1);
+      const found = findRegionInBlob(child, depth + 1, path ? `${path}.${key}` : key);
       if (found) return found;
     }
   }
@@ -88,27 +124,39 @@ export default async function handler(req, res) {
     });
     const html = await resp.text();
 
-    const match = html.match(/<script id="__UNIVERSAL_DATA_FOR_REHYDRATION__" type="application\/json">(.*?)<\/script>/s);
-    if (!match) return res.status(500).json({ error: 'Page structure changed – script not found' });
+    const blobs = extractAllJsonBlobs(html);
 
-    const universal = JSON.parse(match[1]);
-    const userDetail = universal?.['__DEFAULT_SCOPE__']?.['webapp.user-detail'];
-
-    if (debug === '1') {
-      return res.status(200).json({ debug: true, userDetail });
+    // Full debug mode: return all extracted JSON blobs
+    if (debug === 'all') {
+      return res.status(200).json({ success: true, debug: true, blobs });
     }
 
-    if (!userDetail) return res.status(404).json({ error: 'User not found in page data' });
+    if (blobs.length === 0) {
+      return res.status(500).json({ error: 'No JSON data found on page' });
+    }
 
-    // Search inside userDetail only
-    const region = findRegionByKeyName(userDetail);
+    // Search each blob for a region field
+    for (const blob of blobs) {
+      const found = findRegionInBlob(blob.data, 0, blob.source);
+      if (found) {
+        return res.status(200).json({
+          success: true,
+          username,
+          region: found.value,
+          regionSource: `${blob.source} -> ${found.source}`
+        });
+      }
+    }
 
-    res.status(200).json({
+    // Not found
+    return res.status(200).json({
       success: true,
       username,
-      region: region || null,
-      regionSource: region ? 'property-name-match' : null
+      region: null,
+      regionSource: null,
+      note: 'No property containing "region" or "country" with a valid country code was found in any JSON blob. Use debug=all to inspect all data.'
     });
+
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
