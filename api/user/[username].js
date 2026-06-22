@@ -29,40 +29,7 @@ function isValidCountryCode(val) {
   return typeof val === 'string' && val.length === 2 && VALID_COUNTRY_CODES.has(val.toUpperCase());
 }
 
-// Exhaustive scan: find any string that is a valid country code within the object,
-// but only if we are inside a user-like subtree (to avoid app‑context).
-// Returns the code or null.
-function findAnyCountryCode(obj, depth = 0, path = '') {
-  if (!obj || typeof obj !== 'object' || depth > 8) return null;
-
-  // Skip noise branches entirely
-  const lowerPath = path.toLowerCase();
-  if (lowerPath.includes('app-context') || lowerPath.includes('appcontext') ||
-      lowerPath.includes('i18n') || lowerPath.includes('translations') ||
-      lowerPath.includes('messages') || lowerPath.includes('__typename')) {
-    return null;
-  }
-
-  // Check all string values for valid country codes
-  for (const key in obj) {
-    if (typeof obj[key] === 'string' && isValidCountryCode(obj[key].trim())) {
-      return obj[key].trim().toUpperCase();
-    }
-  }
-
-  // Recurse (skip noise keys)
-  for (const key in obj) {
-    if (['i18n','translations','messages','appContext','app-context','__typename'].includes(key)) continue;
-    const child = obj[key];
-    if (child && typeof child === 'object') {
-      const found = findAnyCountryCode(child, depth + 1, path ? `${path}.${key}` : key);
-      if (found) return found;
-    }
-  }
-  return null;
-}
-
-// Find the user object within userDetail (the one that has id/uniqueId/secUid)
+// Find the user object (has id, uniqueId, or secUid) inside userDetail
 function findUserObject(userDetail) {
   const candidates = [
     userDetail?.userInfo?.user,
@@ -74,6 +41,51 @@ function findUserObject(userDetail) {
     if (obj && (obj.id || obj.uniqueId || obj.secUid)) return obj;
   }
   return null;
+}
+
+// Search inside user object for any property whose name contains "region" or "country"
+function extractRegionFromUserObject(userObj) {
+  if (!userObj || typeof userObj !== 'object') return null;
+
+  // Direct known keys
+  const directKeys = ['region', 'accountRegion', 'country', 'countryCode'];
+  for (const key of directKeys) {
+    const val = userObj[key];
+    if (typeof val === 'string') {
+      const code = val.trim().toUpperCase();
+      if (isValidCountryCode(code)) return code;
+      // Locale fallback: e.g. "en-US" => "US"
+      const m = code.match(/[_-]([A-Z]{2})$/);
+      if (m && isValidCountryCode(m[1])) return m[1];
+    }
+  }
+
+  // Scan all properties (including nested, but only if the property name hints at region/country)
+  function scan(obj, depth = 0) {
+    if (!obj || typeof obj !== 'object' || depth > 4) return null;
+    for (const key in obj) {
+      const lowerKey = key.toLowerCase();
+      if (lowerKey.includes('region') || lowerKey.includes('country')) {
+        const val = obj[key];
+        if (typeof val === 'string') {
+          const code = val.trim().toUpperCase();
+          if (isValidCountryCode(code)) return code;
+          const m = code.match(/[_-]([A-Z]{2})$/);
+          if (m && isValidCountryCode(m[1])) return m[1];
+        }
+      }
+      // recurse into sub-objects, but avoid noise
+      if (['i18n','translations','messages','appContext','app-context'].includes(key)) continue;
+      const child = obj[key];
+      if (child && typeof child === 'object') {
+        const found = scan(child, depth + 1);
+        if (found) return found;
+      }
+    }
+    return null;
+  }
+
+  return scan(userObj);
 }
 
 export default async function handler(req, res) {
@@ -106,61 +118,22 @@ export default async function handler(req, res) {
 
     const universal = JSON.parse(mainMatch[1]);
     const userDetail = universal?.['__DEFAULT_SCOPE__']?.['webapp.user-detail'];
-    const appContext = universal?.['__DEFAULT_SCOPE__']?.['webapp.app-context'];
 
-    // Debug: return full userDetail and app-context
-    if (debug === 'all') {
-      return res.status(200).json({ success: true, debug: true, userDetail, appContext });
+    // Debug: return the raw userDetail (without fallbacks)
+    if (debug === '1' || debug === 'all') {
+      return res.status(200).json({ success: true, debug: true, userDetail });
     }
 
     if (!userDetail) return res.status(404).json({ error: 'User not found' });
 
-    let region = null;
-    let source = null;
-
-    // 1. Search inside the user object (direct fields first, then exhaustive)
     const userObj = findUserObject(userDetail);
-    if (userObj) {
-      // Direct known keys
-      region = userObj.region || userObj.accountRegion || userObj.country || userObj.countryCode;
-      if (region && typeof region === 'string' && isValidCountryCode(region)) {
-        region = region.trim().toUpperCase();
-        source = 'user-detail-direct';
-      } else {
-        // Exhaustive search inside the user object (but still within that subtree)
-        region = findAnyCountryCode(userObj, 0, 'user');
-        if (region) source = 'user-detail-exhaustive';
-      }
-    }
-
-    // 2. If still not found, fallback to app-context (only after user search fails)
-    if (!region && appContext?.region && isValidCountryCode(appContext.region)) {
-      region = appContext.region.toUpperCase();
-      source = 'app-context';
-    }
-
-    // 3. Final fallback: avatar idc (not needed for khaby.lame but kept for completeness)
-    if (!region) {
-      const avatarUrl = userDetail?.userInfo?.user?.avatarLarger || userDetail?.user?.avatarLarger || '';
-      const idcMatch = avatarUrl.match(/idc=([^&]+)/);
-      if (idcMatch) {
-        const idc = idcMatch[1].toLowerCase();
-        const idcMap = { useast: 'US', europe: 'GB', asia: 'SG', ap: 'SG', au: 'AU', jp: 'JP', kr: 'KR', sa: 'SA' };
-        for (const prefix of Object.keys(idcMap)) {
-          if (idc.startsWith(prefix)) {
-            region = idcMap[prefix];
-            source = 'avatar-idc';
-            break;
-          }
-        }
-      }
-    }
+    const region = userObj ? extractRegionFromUserObject(userObj) : null;
 
     res.status(200).json({
       success: true,
       username,
       region: region || null,
-      regionSource: source,
+      regionSource: region ? 'user-profile' : null
     });
   } catch (err) {
     res.status(500).json({ error: err.message });
