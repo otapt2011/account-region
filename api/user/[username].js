@@ -29,70 +29,39 @@ function isValidCountryCode(val) {
   return typeof val === 'string' && val.length === 2 && VALID_COUNTRY_CODES.has(val.toUpperCase());
 }
 
-// Extract every JSON blob from the HTML
-function extractAllJsonBlobs(html) {
-  const blobs = [];
+// Search INSIDE an object, but skip any path containing excluded segments.
+// We also skip keys that are not user-related if we are outside the user-detail scope.
+function findRegionSafe(obj, depth = 0, path = '') {
+  if (!obj || typeof obj !== 'object' || depth > 6) return null;
 
-  // __UNIVERSAL_DATA_FOR_REHYDRATION__
-  const mainMatch = html.match(/<script id="__UNIVERSAL_DATA_FOR_REHYDRATION__" type="application\/json">(.*?)<\/script>/s);
-  if (mainMatch) {
-    try { blobs.push({ source: 'UNIVERSAL_DATA', data: JSON.parse(mainMatch[1]) }); } catch(e) {}
+  // Skip entire branches that are definitely noise
+  const lowerPath = path.toLowerCase();
+  if (lowerPath.includes('app-context') || lowerPath.includes('appcontext') ||
+      lowerPath.includes('i18n') || lowerPath.includes('translations') ||
+      lowerPath.includes('messages') || lowerPath.includes('__typename')) {
+    return null;
   }
 
-  // Other application/json scripts
-  const otherScripts = html.match(/<script[^>]*type="application\/json"[^>]*>(.*?)<\/script>/gis);
-  if (otherScripts) {
-    for (const script of otherScripts) {
-      const m = script.match(/>([\s\S]*?)<\/script>/);
-      if (m) {
-        try { blobs.push({ source: 'other_json', data: JSON.parse(m[1]) }); } catch(e) {}
-      }
-    }
-  }
-
-  // Inline scripts with __NEXT_DATA__ or __INITIAL_STATE__
-  const inlineScripts = html.match(/<script[^>]*>([\s\S]*?)<\/script>/gi);
-  if (inlineScripts) {
-    for (const script of inlineScripts) {
-      const nextMatch = script.match(/__NEXT_DATA__\s*=\s*({[\s\S]*?});/);
-      if (nextMatch) {
-        try { blobs.push({ source: 'NEXT_DATA', data: JSON.parse(nextMatch[1]) }); } catch(e) {}
-      }
-      const initMatch = script.match(/window\.__INITIAL_STATE__\s*=\s*({[\s\S]*?});/);
-      if (initMatch) {
-        try { blobs.push({ source: 'INITIAL_STATE', data: JSON.parse(initMatch[1]) }); } catch(e) {}
-      }
-    }
-  }
-
-  return blobs;
-}
-
-// Search a single JSON object for any property name that contains "region" or "country"
-function findRegionInBlob(obj, depth = 0, path = '') {
-  if (!obj || typeof obj !== 'object' || depth > 8) return null;
-
-  // Check all properties whose name includes region/country (case-insensitive)
+  // Check keys whose name contains "region" or "country"
   for (const key in obj) {
     const lowerKey = key.toLowerCase();
     if (lowerKey.includes('region') || lowerKey.includes('country')) {
       const val = obj[key];
       if (typeof val === 'string') {
         const code = val.trim().toUpperCase();
-        if (isValidCountryCode(code)) return { value: code, source: `${path}.${key}` };
-        // Locale like "en-US"
+        if (isValidCountryCode(code)) return code;
         const m = code.match(/[_-]([A-Z]{2})$/);
-        if (m && isValidCountryCode(m[1])) return { value: m[1], source: `${path}.${key}` };
+        if (m && isValidCountryCode(m[1])) return m[1];
       }
     }
   }
 
-  // Recurse, but skip obvious noise
+  // Recurse into sub‑objects (but skip noise keys)
   for (const key in obj) {
     if (['i18n','translations','messages','appContext','app-context','__typename'].includes(key)) continue;
     const child = obj[key];
     if (child && typeof child === 'object') {
-      const found = findRegionInBlob(child, depth + 1, path ? `${path}.${key}` : key);
+      const found = findRegionSafe(child, depth + 1, path ? `${path}.${key}` : key);
       if (found) return found;
     }
   }
@@ -124,39 +93,55 @@ export default async function handler(req, res) {
     });
     const html = await resp.text();
 
-    const blobs = extractAllJsonBlobs(html);
+    // Extract main script
+    const mainMatch = html.match(/<script id="__UNIVERSAL_DATA_FOR_REHYDRATION__" type="application\/json">(.*?)<\/script>/s);
+    if (!mainMatch) return res.status(500).json({ error: 'Page structure changed' });
 
-    // Full debug mode: return all extracted JSON blobs
-    if (debug === 'all') {
-      return res.status(200).json({ success: true, debug: true, blobs });
+    const universal = JSON.parse(mainMatch[1]);
+    const userDetail = universal?.['__DEFAULT_SCOPE__']?.['webapp.user-detail'];
+
+    // Debug: return the raw userDetail (the only relevant part)
+    if (debug === '1' || debug === 'all') {
+      return res.status(200).json({ success: true, debug: true, userDetail });
     }
 
-    if (blobs.length === 0) {
-      return res.status(500).json({ error: 'No JSON data found on page' });
-    }
+    if (!userDetail) return res.status(404).json({ error: 'User not found' });
 
-    // Search each blob for a region field
-    for (const blob of blobs) {
-      const found = findRegionInBlob(blob.data, 0, blob.source);
-      if (found) {
-        return res.status(200).json({
-          success: true,
-          username,
-          region: found.value,
-          regionSource: `${blob.source} -> ${found.source}`
-        });
+    // 1. Direct extraction from the most common user‑object paths
+    const userObjectsToTry = [
+      userDetail?.userInfo?.user,
+      userDetail?.user,
+      userDetail?.userInfo,
+      userDetail
+    ];
+
+    let region = null;
+    for (const obj of userObjectsToTry) {
+      if (!obj) continue;
+      // Only consider objects that look like a user (have id, uniqueId, or secUid)
+      if (obj.id || obj.uniqueId || obj.secUid) {
+        const direct = obj.region || obj.accountRegion || obj.country || obj.countryCode;
+        if (typeof direct === 'string' && isValidCountryCode(direct)) {
+          region = direct.trim().toUpperCase();
+          break;
+        }
+        // Also try a safe recursive scan inside this user object
+        region = findRegionSafe(obj, 0, 'user');
+        if (region) break;
       }
     }
 
-    // Not found
-    return res.status(200).json({
+    // 2. If still not found, perform a safe recursive scan over the whole userDetail
+    if (!region) {
+      region = findRegionSafe(userDetail, 0, 'userDetail');
+    }
+
+    res.status(200).json({
       success: true,
       username,
-      region: null,
-      regionSource: null,
-      note: 'No property containing "region" or "country" with a valid country code was found in any JSON blob. Use debug=all to inspect all data.'
+      region: region || null,
+      regionSource: region ? 'user-detail' : null
     });
-
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
